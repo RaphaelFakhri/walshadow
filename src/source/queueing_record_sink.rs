@@ -156,7 +156,7 @@ impl QueueingRecordSink {
                     in_flight_w.fetch_sub(n, Ordering::Relaxed);
                     rx.close();
                     while let Some(rest) = rx.recv().await {
-                        in_flight_w.fetch_sub(rest.len, Ordering::Relaxed);
+                        in_flight_w.fetch_sub(rest.len + rest.skipped, Ordering::Relaxed);
                     }
                 };
             'outer: loop {
@@ -174,7 +174,7 @@ impl QueueingRecordSink {
                                 Ok(decoded) => decoded,
                                 Err(e) => {
                                     let e = SinkError::Other(format!("predecode job: {e}"));
-                                    park_err_and_drain(e, n, &mut rx).await;
+                                    park_err_and_drain(e, n + skipped, &mut rx).await;
                                     break 'outer;
                                 }
                             },
@@ -213,14 +213,14 @@ impl QueueingRecordSink {
                         .instrument(queuingthread)
                         .await;
                         if let Err(e) = outcome {
-                            park_err_and_drain(e, n, &mut rx).await;
+                            park_err_and_drain(e, n + skipped, &mut rx).await;
                             break 'outer;
                         }
                         // Free off the serial worker: record bytes come from the pump's
                         // heap, so each free here is a cross-thread one
                         tokio::task::spawn_blocking(move || drop((batch, pre)));
                         processed_w.fetch_add(n + skipped, Ordering::Relaxed);
-                        in_flight_w.fetch_sub(n, Ordering::Relaxed);
+                        in_flight_w.fetch_sub(n + skipped, Ordering::Relaxed);
                     }
                     Ok(None) => {
                         // Channel closed by `close`. Final shutdown
@@ -269,9 +269,10 @@ impl QueueingRecordSink {
         self
     }
 
-    /// Pump-queue depth: in-channel + pump-side buffer, for metrics.
+    /// Pump-queue depth: in-channel + pump-side buffer, skipped records
+    /// included since their positions still wait on the worker
     pub fn in_flight(&self) -> u64 {
-        self.in_flight.load(Ordering::Relaxed) + self.buf.len() as u64
+        self.in_flight.load(Ordering::Relaxed) + self.buf.len() as u64 + self.skipped
     }
 
     /// Records the worker has dispatched (see the `processed` field).
@@ -315,7 +316,7 @@ impl QueueingRecordSink {
             }
         }
         let n = batch.len() as u64;
-        self.in_flight.fetch_add(n, Ordering::Relaxed);
+        self.in_flight.fetch_add(n + skipped, Ordering::Relaxed);
         let tx = self
             .tx
             .as_ref()
@@ -346,7 +347,7 @@ impl QueueingRecordSink {
             .send_wait_nanos
             .saturating_add(started.elapsed().as_nanos() as u64);
         if sent.is_err() {
-            self.in_flight.fetch_sub(n, Ordering::Relaxed);
+            self.in_flight.fetch_sub(n + skipped, Ordering::Relaxed);
             if let Some(e) = self.take_pending_error() {
                 return Err(e);
             }
