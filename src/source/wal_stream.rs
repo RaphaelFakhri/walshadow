@@ -369,11 +369,15 @@ impl WalStream {
                         self.filter.decide_header_only(&record.parsed, source_lsn);
                     record
                 }
-                None => {
-                    self.decide(&completed, source_lsn, &last_range, record_sink)
-                        .await?
-                }
+                None => self.decide(&completed, source_lsn, &last_range, record_sink)?,
             };
+            // The flush future is several hundred bytes, moved on every await
+            if self.filter.shadow_rels_dirty() {
+                self.filter
+                    .flush_shadow_rels()
+                    .await
+                    .map_err(WalStreamError::ShadowRelations)?;
+            }
             if record.route == Route::ToDecoder {
                 // `record` owns the original bytes the decoder reads, so
                 // clobbering the buffer with the NOOP is safe.
@@ -409,7 +413,7 @@ impl WalStream {
     }
 
     /// Full parse and routing verdict of `completed`
-    async fn decide(
+    fn decide(
         &mut self,
         completed: &CompletedRecord,
         source_lsn: u64,
@@ -449,10 +453,6 @@ impl WalStream {
                 }
             }
         };
-        self.filter
-            .flush_shadow_rels()
-            .await
-            .map_err(WalStreamError::ShadowRelations)?;
         Ok(record)
     }
 
