@@ -245,6 +245,13 @@ pub trait RecordSink: Send {
         true
     }
 
+    /// Whether dispatching `record` reads nothing past its header, xids and
+    /// verdict, so the pump may hand it over without parsing blocks or main
+    /// data. `record` holds only those
+    fn header_only(&self, _record: &Record<'_>) -> bool {
+        false
+    }
+
     /// Whether `on_record` may wait on shadow replaying this record's bytes.
     /// The pump ships bytes through such a record, and none past it, before
     /// dispatching it; records answering `false` may dispatch after bytes of

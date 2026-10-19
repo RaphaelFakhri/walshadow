@@ -389,10 +389,7 @@ impl CatalogTracker {
         for block in &record.blocks {
             let loc = block.header.location;
             let (db, rel, blk) = (loc.rel.db_node, loc.rel.rel_node, loc.block_no);
-            if !block.header.has_image()
-                || !(self.is_pg_class_relfilenode(db, rel)
-                    || self.pg_class_transient.get(&db) == Some(&rel))
-            {
+            if !block.header.has_image() || !self.reads_image(db, rel) {
                 continue;
             }
             self.catalog_slots
@@ -407,6 +404,11 @@ impl CatalogTracker {
                 }
             }
         }
+    }
+
+    /// Whether a page image of this relation teaches pg_class slots
+    pub fn reads_image(&self, db: u32, rel: u32) -> bool {
+        self.is_pg_class_relfilenode(db, rel) || self.pg_class_transient.get(&db) == Some(&rel)
     }
 
     /// Return true for a statistics catalog filenode
