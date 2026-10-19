@@ -137,7 +137,10 @@ pub(crate) struct Args {
     /// segment boundary.
     #[arg(long)]
     pub(crate) start_lsn: Option<String>,
-    #[arg(long, default_value_t = 10)]
+    /// Seconds between standby status replies and resume manifest writes.
+    /// Zero is refused: PostgreSQL takes a zero `wal_receiver_status_interval`
+    /// to mean no replies, and the source keeps WAL until a reply releases it
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) status_interval: u64,
 
     /// Concurrent archive fetches, each holding at most one WAL segment.

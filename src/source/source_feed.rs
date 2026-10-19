@@ -380,10 +380,15 @@ impl SourceFeed {
                 "source replication receive timeout"
             );
             let status_interval = self.status_interval.min(RECEIVE_TIMEOUT / 2);
-            if self.last_status.elapsed() >= status_interval {
+            // Report a durable advance early, as PostgreSQL's walreceiver does
+            // after each flush, at most ten times per interval
+            let advanced =
+                status.apply_lsn > self.floors.apply || status.flush_lsn > self.floors.flush;
+            let gap = status_interval / if advanced { 10 } else { 1 };
+            if self.last_status.elapsed() >= gap {
                 self.send_status(status).await?;
             }
-            let status_due = self.last_status + status_interval;
+            let status_due = self.last_status + gap;
             let wake = status_due.max(Instant::now() + Duration::from_millis(50));
             let Ok(msg) =
                 tokio::time::timeout_at(deadline.min(wake), self.conn.recv_message()).await
@@ -691,6 +696,64 @@ mod tests {
                 Ok(Ok(event)) => panic!("unexpected event: {event:?}"),
             }
         }
+    }
+
+    /// While apply climbs, replies report it about a tenth of the status
+    /// interval apart: no sooner, and not much later
+    #[tokio::test(start_paused = true)]
+    async fn advance_is_reported_within_a_tenth_of_the_interval() {
+        let (feed, mut server) = mock_feed().await;
+        let mut feed = feed.with_status_interval(Duration::from_secs(10));
+        let replies = tokio::spawn(async move {
+            let mut applied = Vec::new();
+            while let Ok(tag) = server.read_u8().await {
+                assert_eq!(tag, b'd');
+                let len = server.read_u32().await.unwrap() as usize;
+                let mut body = vec![0; len - 4];
+                server.read_exact(&mut body).await.unwrap();
+                applied.push(u64::from_be_bytes(body[17..25].try_into().unwrap()));
+            }
+            applied
+        });
+        let mut buf = Vec::new();
+        // Apply reads as the milliseconds since start, one step per 100 ms
+        for step in 0..60u64 {
+            let status = StandbyStatus {
+                write_lsn: Pos::new(100 * step),
+                flush_lsn: Pos::ZERO,
+                apply_lsn: Pos::new(100 * step),
+            };
+            let poll = feed.next_event(status, &mut buf);
+            let timed_out = tokio::time::timeout(Duration::from_millis(100), poll).await;
+            assert!(timed_out.is_err());
+        }
+        drop(feed);
+        let applied = replies.await.unwrap();
+        assert!(applied.len() >= 5, "{applied:?}");
+        assert!(applied[0] <= 1100, "{applied:?}");
+        for pair in applied.windows(2) {
+            assert!((1000..=1100).contains(&(pair[1] - pair[0])), "{applied:?}");
+        }
+    }
+
+    /// A reply due on every pass still leaves room to read WAL already sent
+    #[tokio::test(start_paused = true)]
+    async fn zero_interval_reads_buffered_wal() {
+        let (feed, mut server) = mock_feed().await;
+        let mut feed = feed.with_status_interval(Duration::ZERO);
+        let mut frame = vec![b'w'];
+        for field in [16u64, 19, 0] {
+            frame.extend_from_slice(&field.to_be_bytes());
+        }
+        frame.extend_from_slice(b"wal");
+        backend(&mut server, b'd', &frame).await;
+        let mut buf = Vec::new();
+        let poll = feed.next_event(StandbyStatus::default(), &mut buf);
+        let event = tokio::time::timeout(Duration::from_secs(1), poll).await;
+        assert!(
+            matches!(event, Ok(Ok(SourceEvent::Wal(w))) if w.start_lsn == 16 && w.data == b"wal"),
+            "{event:?}"
+        );
     }
 
     fn triple(s: StandbyStatus) -> (u64, u64, u64) {
