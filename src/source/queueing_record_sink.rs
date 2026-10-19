@@ -216,6 +216,9 @@ impl QueueingRecordSink {
                             park_err_and_drain(e, n, &mut rx).await;
                             break 'outer;
                         }
+                        // Free off the serial worker: record bytes come from the pump's
+                        // heap, so each free here is a cross-thread one
+                        tokio::task::spawn_blocking(move || drop((batch, pre)));
                         processed_w.fetch_add(n + skipped, Ordering::Relaxed);
                         in_flight_w.fetch_sub(n, Ordering::Relaxed);
                     }
