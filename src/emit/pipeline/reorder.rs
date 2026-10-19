@@ -1540,7 +1540,9 @@ impl RecordSink for ReorderSink {
         _pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            for record in batch {
+            // Filter before building the per-record future: it embeds the
+            // commit path's state and moving it costs more than the check
+            for record in batch.iter().filter(|r| Self::wants(r)) {
                 self.handle(record).await?;
             }
             self.ship().await
