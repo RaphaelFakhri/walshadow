@@ -1,7 +1,7 @@
 //! Process-global tracing knobs, set once at startup.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use ahash::HashMap;
@@ -39,9 +39,16 @@ struct TxnSpans {
     sampled: bool,
 }
 
+#[derive(Default)]
+struct Spans {
+    /// Set by the first `open`; until then every lookup skips the lock
+    opened: AtomicBool,
+    map: std::sync::Mutex<HashMap<u32, TxnSpans>>,
+}
+
 #[derive(Clone, Default)]
 pub struct TxnSpanRegistry {
-    inner: Arc<std::sync::Mutex<HashMap<u32, TxnSpans>>>,
+    inner: Arc<Spans>,
 }
 
 impl TxnSpanRegistry {
@@ -49,38 +56,45 @@ impl TxnSpanRegistry {
         Self::default()
     }
 
-    pub fn is_sampled(&self, xid: u32) -> bool {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, TxnSpans>> {
+        self.inner.map.lock().expect("txn span registry poisoned")
+    }
+
+    /// Lock only once some xid was opened; registries nobody opens into
+    /// cost one relaxed load per call
+    fn opened(&self) -> Option<std::sync::MutexGuard<'_, HashMap<u32, TxnSpans>>> {
         self.inner
-            .lock()
-            .expect("txn span registry poisoned")
-            .get(&xid)
-            .is_some_and(|entry| entry.sampled)
+            .opened
+            .load(Ordering::Relaxed)
+            .then(|| self.lock())
+    }
+
+    pub fn is_sampled(&self, xid: u32) -> bool {
+        self.opened()
+            .is_some_and(|spans| spans.get(&xid).is_some_and(|entry| entry.sampled))
     }
 
     pub fn open(&self, xid: u32, first_lsn: u64) {
         if xid == 0 {
             return;
         }
-        self.inner
-            .lock()
-            .expect("txn span registry poisoned")
-            .entry(xid)
-            .or_insert_with(|| TxnSpans {
-                txn: None,
-                first_lsn,
-                read_at: Instant::now(),
-                shipped_at: None,
-                decode_parent: None,
-                sampled: should_sample(),
-            });
+        self.inner.opened.store(true, Ordering::Relaxed);
+        self.lock().entry(xid).or_insert_with(|| TxnSpans {
+            txn: None,
+            first_lsn,
+            read_at: Instant::now(),
+            shipped_at: None,
+            decode_parent: None,
+            sampled: should_sample(),
+        });
     }
 
     pub fn note_shipped(&self, xid: u32) {
         if xid == 0 {
             return;
         }
-        let mut spans = self.inner.lock().expect("txn span registry poisoned");
-        if let Some(entry) = spans.get_mut(&xid)
+        if let Some(mut spans) = self.opened()
+            && let Some(entry) = spans.get_mut(&xid)
             && entry.shipped_at.is_none()
         {
             entry.shipped_at = Some(Instant::now());
@@ -91,7 +105,9 @@ impl TxnSpanRegistry {
         if xid == 0 {
             return false;
         }
-        let mut spans = self.inner.lock().expect("txn span registry poisoned");
+        let Some(mut spans) = self.opened() else {
+            return false;
+        };
         let Some(entry) = spans.get_mut(&xid) else {
             return false;
         };
@@ -113,33 +129,25 @@ impl TxnSpanRegistry {
     }
 
     pub fn txn_span(&self, xid: u32) -> Option<tracing::Span> {
-        self.inner
-            .lock()
-            .expect("txn span registry poisoned")
-            .get(&xid)
-            .and_then(|entry| entry.txn.clone())
+        self.opened()?.get(&xid)?.txn.clone()
     }
 
     pub fn adopt(&self, xid: u32) -> Option<tracing::Span> {
-        let mut spans = self.inner.lock().expect("txn span registry poisoned");
+        let mut spans = self.opened()?;
         let entry = spans.get_mut(&xid)?;
         entry.decode_parent = None;
         entry.txn.clone()
     }
 
     pub fn decode_parent(&self, xid: u32) -> Option<tracing::Span> {
-        self.inner
-            .lock()
-            .expect("txn span registry poisoned")
-            .get(&xid)?
-            .decode_parent
-            .clone()
+        self.opened()?.get(&xid)?.decode_parent.clone()
     }
 
     pub fn prune(&self, xids: &[u32]) {
-        let mut spans = self.inner.lock().expect("txn span registry poisoned");
-        for xid in xids {
-            spans.remove(xid);
+        if let Some(mut spans) = self.opened() {
+            for xid in xids {
+                spans.remove(xid);
+            }
         }
     }
 }
