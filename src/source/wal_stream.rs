@@ -39,6 +39,7 @@ use walrus::pg::walparser::{
 };
 
 use crate::filter::Filter;
+use crate::filter::header_walk;
 use crate::filter::rewrite::{RewriteError, noop_replace};
 use crate::pos::{Floor, Pos};
 #[cfg(test)]
@@ -368,7 +369,10 @@ impl WalStream {
                         self.filter.decide_header_only(&record.parsed, source_lsn);
                     record
                 }
-                None => self.decide(&completed, source_lsn, &last_range).await?,
+                None => {
+                    self.decide(&completed, source_lsn, &last_range, record_sink)
+                        .await?
+                }
             };
             if record.route == Route::ToDecoder {
                 // `record` owns the original bytes the decoder reads, so
@@ -410,13 +414,15 @@ impl WalStream {
         completed: &CompletedRecord,
         source_lsn: u64,
         last_range: &(usize, usize),
+        record_sink: &mut (dyn RecordSink + Send),
     ) -> Result<Record<'static>, WalStreamError> {
         let offset = completed.start_offset;
         let page_magic = completed.page_magic;
         // Materialise to `'static` so the in-place NOOP can take
         // `&mut self.walker`, and the decoder reads the original bytes
-        // after the shadow stream is clobbered
-        let (verdict, parsed) = {
+        // after the shadow stream is clobbered. Skip the copy when
+        // dispatch reads only the header
+        let record = {
             let parsed =
                 parse_record_from_bytes(completed.logical_bytes(self.walker.buffer()), page_magic)
                     .map_err(|source| WalStreamError::Parse { offset, source })?;
@@ -424,22 +430,30 @@ impl WalStream {
                 .filter
                 .decide_record(&parsed, source_lsn, page_magic)
                 .map_err(|source| WalStreamError::Payload { offset, source })?;
-            (verdict, parsed.into_owned())
+            let header = Record {
+                parsed: header_walk::header_part(&parsed),
+                next_lsn: self.end_rec_ptr(last_range, &parsed),
+                source_lsn,
+                page_magic,
+                route: verdict.route,
+                boundary_info: verdict.boundary,
+                aborted_tree: verdict.aborted_tree,
+                defer_catalog_decode: verdict.defer_catalog_decode,
+            };
+            if record_sink.header_only(&header) {
+                header
+            } else {
+                Record {
+                    parsed: parsed.into_owned(),
+                    ..header
+                }
+            }
         };
         self.filter
             .flush_shadow_rels()
             .await
             .map_err(WalStreamError::ShadowRelations)?;
-        Ok(Record {
-            next_lsn: self.end_rec_ptr(last_range, &parsed),
-            parsed,
-            source_lsn,
-            page_magic,
-            route: verdict.route,
-            boundary_info: verdict.boundary,
-            aborted_tree: verdict.aborted_tree,
-            defer_catalog_decode: verdict.defer_catalog_decode,
-        })
+        Ok(record)
     }
 
     /// Ship staged records' bytes, then hand the records to `record_sink`
