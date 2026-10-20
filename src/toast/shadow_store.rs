@@ -10,6 +10,7 @@
 //! reject decoded `ToastRow` values.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -70,6 +71,12 @@ impl From<&crate::ops::oracle::Oracle> for ShadowRead {
 pub struct ShadowToastStore {
     read: ShadowRead,
     replay_wait_max: Duration,
+    /// Newest replay position the bridge reported, with the bridge's
+    /// redial count then. A redial may mean a restarted shadow whose replay
+    /// resumed lower, so the position counts only until the next one
+    replayed: tokio::sync::watch::Sender<(u64, u64)>,
+    /// Held by the one waiter polling replay
+    polling: tokio::sync::Mutex<()>,
 }
 
 impl ShadowToastStore {
@@ -82,6 +89,8 @@ impl ShadowToastStore {
         Self {
             read: read.into(),
             replay_wait_max: REPLAY_WAIT_MAX,
+            replayed: tokio::sync::watch::Sender::new((0, 0)),
+            polling: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -107,6 +116,15 @@ impl ShadowToastStore {
         }
     }
 
+    /// Replay position known since the bridge last redialled
+    fn known_replay(&self, bridge: &Bridge, (at, dials): (u64, u64)) -> u64 {
+        if dials == bridge.stats.reconnects.load(Ordering::Relaxed) {
+            at
+        } else {
+            0
+        }
+    }
+
     /// Wait until shadow has applied through `through`.
     ///
     /// `WalStream` dispatches record bytes before awaiting record sink. WAL
@@ -125,12 +143,33 @@ impl ShadowToastStore {
         if through == 0 || !bridge.info().in_recovery {
             return Ok(0);
         }
+        let mut seen = self.replayed.subscribe();
         let mut since = Instant::now();
         let mut last: Option<u64> = None;
         let mut unreachable = false;
         let mut poll = REPLAY_POLL;
         loop {
-            match bridge.replay_lsn().await {
+            let at = self.known_replay(bridge, *seen.borrow_and_update());
+            if at >= through {
+                return Ok(through);
+            }
+            // One waiter polls, the rest follow its answers
+            let turn = self.polling.try_lock();
+            let polled = match turn {
+                Ok(_) => bridge.replay_lsn().await,
+                Err(_) => Ok(at),
+            };
+            if let (Ok(at), Ok(_)) = (&polled, &turn) {
+                let dials = bridge.stats.reconnects.load(Ordering::Relaxed);
+                self.replayed.send_if_modified(|v| {
+                    let newer = v.1 != dials || *at > v.0;
+                    if newer {
+                        *v = (*at, dials);
+                    }
+                    newer
+                });
+            }
+            match polled {
                 Ok(at) if at >= through => return Ok(through),
                 Ok(at) => {
                     if unreachable || last != Some(at) {
@@ -177,7 +216,10 @@ impl ShadowToastStore {
                     )
                 }));
             }
-            tokio::time::sleep(poll).await;
+            match turn {
+                Ok(_turn) => tokio::time::sleep(poll).await,
+                Err(_) => drop(tokio::time::timeout(poll, seen.changed()).await),
+            }
         }
     }
 }
@@ -197,22 +239,42 @@ impl ChunkStore for ShadowToastStore {
             return Ok(Vec::new());
         }
         let bridge = self.bridge().await?;
-        // Wait once for complete batch
-        let floor = self.await_replay(bridge, max_lsn).await?;
         // Batch bound is the newest referring record, so its ceiling covers
         // every value here
         let ceiling = self.read.ceiling.at(max_lsn);
-        let mut out = Vec::with_capacity(values.len());
-        // Split resolver batch to satisfy wire limits
-        for slice in request_slices(values) {
-            let got = bridge
-                .fetch_toast(toast_relid, slice, floor)
-                .await
-                .map_err(|e| ChunkStoreError::Shadow(e.to_string()))?;
-            out.extend(got.into_iter().map(|c| judge(c, ceiling)));
+        // Bridge refuses a floor above replay, so reading at a covered bound
+        // skips the replay round trip. Shadow restart can rewind replay
+        // below the remembered position, so a failed read waits and retries
+        let known = *self.replayed.borrow();
+        if max_lsn != 0 && self.known_replay(bridge, known) >= max_lsn {
+            if let Ok(got) = read_values(bridge, toast_relid, values, max_lsn, ceiling).await {
+                return Ok(got);
+            }
+            self.replayed.send_replace((0, 0));
         }
-        Ok(out)
+        // Wait once for complete batch
+        let floor = self.await_replay(bridge, max_lsn).await?;
+        read_values(bridge, toast_relid, values, floor, ceiling).await
     }
+}
+
+/// Split resolver batch to satisfy wire limits
+async fn read_values(
+    bridge: &Bridge,
+    toast_relid: u32,
+    values: &[(u32, usize)],
+    floor: u64,
+    ceiling: u32,
+) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+    let mut out = Vec::with_capacity(values.len());
+    for slice in request_slices(values) {
+        let got = bridge
+            .fetch_toast(toast_relid, slice, floor)
+            .await
+            .map_err(|e| ChunkStoreError::Shadow(e.to_string()))?;
+        out.extend(got.into_iter().map(|c| judge(c, ceiling)));
+    }
+    Ok(out)
 }
 
 /// Detect reused IDs from chunks newer than referring record
@@ -251,6 +313,7 @@ fn request_slices(values: &[(u32, usize)]) -> impl Iterator<Item = &[(u32, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn a_run_younger_than_the_ceiling_reads_as_a_later_generation() {
@@ -296,6 +359,118 @@ mod tests {
             FetchedValue::Generation,
             "xid order wraps",
         );
+    }
+
+    /// Standby shadow behind a bridge worker. Refuses reads above replay, as
+    /// `ws_handle_fetch_toast` does, logs the replay position each read was
+    /// served at, and on restart drops its sockets with replay rewound
+    #[derive(Default)]
+    struct Standby {
+        replay: AtomicU64,
+        restarts: AtomicU64,
+        polls: AtomicU64,
+        served: std::sync::Mutex<Vec<u64>>,
+    }
+
+    async fn worker(listener: tokio::net::UnixListener, shadow: Arc<Standby>) {
+        use crate::ops::bridge::{PROJECTION_VERSION, PROTO_VERSION};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let shadow = shadow.clone();
+            let life = shadow.restarts.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut hdr = [0u8; 4];
+                while sock.read_exact(&mut hdr).await.is_ok() {
+                    let mut req = vec![0u8; u32::from_be_bytes(hdr) as usize];
+                    sock.read_exact(&mut req).await.unwrap();
+                    if shadow.restarts.load(Ordering::SeqCst) != life {
+                        return;
+                    }
+                    let at = shadow.replay.load(Ordering::SeqCst);
+                    let mut body = vec![0u8];
+                    match req[0] {
+                        1 => {
+                            for v in [PROTO_VERSION, PROJECTION_VERSION, 180006] {
+                                body.extend(v.to_be_bytes());
+                            }
+                            body.push(1);
+                            body.extend(5u32.to_be_bytes());
+                        }
+                        4 => {
+                            shadow.polls.fetch_add(1, Ordering::SeqCst);
+                            body.extend(at.to_be_bytes());
+                        }
+                        _ if u64::from_be_bytes(req[1..9].try_into().unwrap()) > at => {
+                            body = vec![1, 0, 0, 0, 5];
+                            body.extend(b"below");
+                        }
+                        _ => {
+                            shadow.served.lock().unwrap().push(at);
+                            body.extend(&req[13..17]);
+                            body.extend([0, 0, 0, 0, 0, 0, 0, 0, 1, b'v']);
+                        }
+                    }
+                    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+                    frame.extend(body);
+                    sock.write_all(&frame).await.unwrap();
+                }
+            });
+        }
+    }
+
+    /// Over random replay progress, restarts that drop the sockets and
+    /// resume replay lower, and read bounds below and above replay: every
+    /// read is served at a replay position covering its bound, never fails,
+    /// and polls replay only for bounds no answer since the last redial covers
+    #[tokio::test(flavor = "current_thread")]
+    async fn reads_never_land_below_replay_across_restarts() {
+        let v = FetchedValue::Assembled(b"v".to_vec());
+        let (mut reads, mut polls) = (0u64, 0u64);
+        for seed in 1..=20u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut below = |n: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % n
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("bridge.sock");
+            let shadow = Arc::new(Standby::default());
+            shadow.replay.store(1000, Ordering::SeqCst);
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            tokio::spawn(worker(listener, shadow.clone()));
+            let store = ShadowToastStore::new(Arc::new(Bridge::connect(&path).await.unwrap()));
+            for _ in 0..40 {
+                match below(8) {
+                    0 => {
+                        shadow.restarts.fetch_add(1, Ordering::SeqCst);
+                        let at = shadow.replay.load(Ordering::SeqCst);
+                        shadow.replay.store(at - below(at), Ordering::SeqCst);
+                    }
+                    1 | 2 => drop(shadow.replay.fetch_add(below(500), Ordering::SeqCst)),
+                    _ => {
+                        let at = shadow.replay.load(Ordering::SeqCst);
+                        // One read in five waits for replay to pass its bound
+                        let bound = 1 + below(at) + u64::from(below(5) == 0) * 300;
+                        let catch_up = async {
+                            while shadow.replay.load(Ordering::SeqCst) < bound {
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                                shadow.replay.fetch_add(50, Ordering::SeqCst);
+                            }
+                        };
+                        let (got, ()) = tokio::join!(store.fetch(0, 1, 7, bound, 1), catch_up);
+                        assert_eq!(got.unwrap(), v, "seed {seed} bound {bound}");
+                        let served = *shadow.served.lock().unwrap().last().unwrap();
+                        assert!(served >= bound, "seed {seed}: read at {served} for {bound}");
+                        reads += 1;
+                    }
+                }
+            }
+            polls += shadow.polls.load(Ordering::SeqCst);
+        }
+        assert!(polls * 2 < reads, "{polls} replay polls for {reads} reads");
     }
 
     #[test]
