@@ -186,9 +186,9 @@ pub(crate) struct Args {
     /// it before shadow starts, so port 0 is rejected
     #[arg(long)]
     pub(crate) walsender_bind: SocketAddr,
-    /// Slow-client backpressure: bytes queued onto a slow shadow
-    /// connection before it's dropped + the wire falls back to
-    /// `restore_command`.
+    /// Slow-client backpressure: bytes queued onto a shadow connection
+    /// before the pump waits for it to drain. One still full after 10 s
+    /// is dropped and the shadow falls back to `restore_command`.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub(crate) walsender_slow_threshold: usize,
     /// Seconds the pump waits for shadow's walreceiver to attach before

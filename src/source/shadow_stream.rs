@@ -6,8 +6,9 @@
 //! shadow's flush/apply LSNs back; the min across connections gates the
 //! catalog.
 //!
-//! Backpressure: a send buffer past `slow_connection_threshold` is dropped and
-//! the walreceiver reconnects. Since the pump streams live (it doesn't replay
+//! Backpressure: a send buffer past `slow_threshold` parks the pump until the
+//! listener drains it, and one still full after `BACKLOG_GRACE` is dropped
+//! and the walreceiver reconnects. Since the pump streams live (it doesn't replay
 //! history), a reconnect lands *behind* the head; [`ShadowStreamState`] retains
 //! the current segment's wire bytes and backfills `[reconnect_lsn, head]` on
 //! connect so the stream stays contiguous. Older complete segments come from
@@ -34,8 +35,8 @@ use walrus::pg::replication::server::{
 use walrus::pg::replication::stream::{encode_keepalive_frame_into, encode_wal_data_frame_into};
 
 use crate::pos::{
-    AppliedWake, Gate, Monotone, Pos, QueuedWake, ShadowDispatched, ShadowFlush, ShadowReplay,
-    SourceReceived,
+    AppliedWake, DrainedWake, Gate, Monotone, Pos, QueuedWake, ShadowDispatched, ShadowFlush,
+    ShadowReplay, SourceReceived,
 };
 use crate::record::{RecordBytesSink, SinkError};
 use ahash::{HashMap, HashMapExt};
@@ -236,6 +237,8 @@ pub struct ShadowStreamState {
     /// Bumped when a client's apply LSN advances: wakes a publication hold
     /// on the standby status that releases it
     applied: Monotone<AppliedWake>,
+    /// Wakes a pump parked on a backlogged client
+    drained: Monotone<DrainedWake>,
 }
 
 impl ShadowStreamState {
@@ -263,6 +266,7 @@ impl ShadowStreamState {
             wire_buf_start: current_lsn,
             queued: Monotone::default(),
             applied: Monotone::default(),
+            drained: Monotone::default(),
         }
     }
 
@@ -550,6 +554,18 @@ impl ShadowStreamState {
         self.send_queues.remove(&id);
         // Removing laggard can raise aggregate and release hold
         self.applied.bump();
+        self.drained.bump();
+    }
+
+    /// A streaming client whose queue has no room for a `len`-byte chunk
+    /// until the listener takes it
+    fn backlogged(&self, len: usize) -> bool {
+        self.connections.iter().any(|(id, c)| {
+            c.phase.is_streaming()
+                && self.send_queues.get(id).is_some_and(|q| {
+                    !q.is_empty() && q.len() + WAL_FRAME_HEADER + len > self.slow_threshold
+                })
+        })
     }
 
     /// Record an inbound `'r'` standby status.
@@ -572,6 +588,7 @@ impl ShadowStreamState {
 
     /// Listener pulls framed bytes out of here.
     pub fn drain_send_queue(&mut self, id: u64) -> Option<Vec<u8>> {
+        self.drained.bump();
         self.send_queues.remove(&id)
     }
 
@@ -581,6 +598,7 @@ impl ShadowStreamState {
         buf.clear();
         if let Some(q) = self.send_queues.get_mut(&id) {
             std::mem::swap(q, buf);
+            self.drained.bump();
         }
     }
 
@@ -691,6 +709,14 @@ impl ShadowStreamSink {
     }
 }
 
+/// CopyData envelope plus `'w'` header ahead of each framed chunk
+const WAL_FRAME_HEADER: usize = 30;
+
+/// Longest the pump waits on a client's backlog before dropping it. A
+/// walreceiver stalled in fsync catches up, and every drop sends the shadow
+/// back through `restore_command`
+const BACKLOG_GRACE: Duration = Duration::from_secs(10);
+
 impl RecordBytesSink for ShadowStreamSink {
     fn on_wire_chunk<'a>(
         &'a mut self,
@@ -698,8 +724,18 @@ impl RecordBytesSink for ShadowStreamSink {
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.state.lock().await.dispatch_wire(start_lsn, bytes);
-            Ok(())
+            let deadline = tokio::time::Instant::now() + BACKLOG_GRACE;
+            loop {
+                let mut s = self.state.lock().await;
+                if !s.backlogged(bytes.len()) || tokio::time::Instant::now() >= deadline {
+                    s.dispatch_wire(start_lsn, bytes);
+                    return Ok(());
+                }
+                let drained = s.drained.watch();
+                let seen = drained.current();
+                drop(s);
+                let _ = tokio::time::timeout_at(deadline, drained.advance(seen)).await;
+            }
         })
     }
 
@@ -1077,7 +1113,7 @@ mod tests {
         let mut s = state.lock().await;
         let q = s.drain_send_queue(id).expect("ancestor bytes served");
         assert_eq!(
-            &q[WIRE_HDR..],
+            &q[WAL_FRAME_HEADER..],
             b"AAAA",
             "served to the switchpoint and no further",
         );
@@ -1114,7 +1150,7 @@ mod tests {
             .register_connection(0x1000, 1, Some(switch))
             .expect("timeline 1 is known");
         let q = s.drain_send_queue(id).expect("ancestor bytes backfilled");
-        assert_eq!(&q[WIRE_HDR..], b"AAAA", "descendant bytes withheld");
+        assert_eq!(&q[WAL_FRAME_HEADER..], b"AAAA", "descendant bytes withheld");
         assert_eq!(s.timeline_ended_for(id), Some(switch));
     }
 
@@ -1307,10 +1343,6 @@ mod tests {
         assert_eq!(&qb[30..], bytes);
     }
 
-    // 'w' frame prefix: 'd'(1) + len(4) + 'w'(1) + start_lsn(8) + wal_end(8) +
-    // send_time(8) = 30 bytes; payload follows.
-    const WIRE_HDR: usize = 30;
-
     /// `(lsn, payload length)` of each `'w'` frame in a send queue
     fn frames(mut q: &[u8]) -> Vec<(u64, usize)> {
         let mut out = Vec::new();
@@ -1318,7 +1350,7 @@ mod tests {
             let len = 1 + u32::from_be_bytes(q[1..5].try_into().unwrap()) as usize;
             if q[5] == b'w' {
                 let lsn = u64::from_be_bytes(q[6..14].try_into().unwrap());
-                out.push((lsn, len - WIRE_HDR));
+                out.push((lsn, len - WAL_FRAME_HEADER));
             }
             q = &q[len..];
         }
@@ -1354,6 +1386,38 @@ mod tests {
         }
     }
 
+    /// A backlog the listener drains parks the pump rather than costing the
+    /// client its stream; one never drained is dropped once the grace runs out
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn backlog_parks_the_pump_before_dropping_the_client() {
+        let state = Arc::new(Mutex::new(ShadowStreamState::new(
+            1,
+            "x".into(),
+            0,
+            2 * WAL_FRAME_HEADER + 8,
+        )));
+        let id = state.lock().await.register_connection(0, 1, None).unwrap();
+        let mut sink = ShadowStreamSink::new(state.clone());
+        sink.on_wire_chunk(0, b"AAAA").await.unwrap();
+        let listener = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                state.lock().await.swap_send_queue(id, &mut Vec::new());
+            }
+        });
+        let parked = tokio::time::Instant::now();
+        sink.on_wire_chunk(4, b"BBBBBBBB").await.unwrap();
+        assert!(parked.elapsed() >= Duration::from_secs(1));
+        listener.await.unwrap();
+        assert_eq!(state.lock().await.aggregate().dropped_total, 0);
+
+        let parked = tokio::time::Instant::now();
+        sink.on_wire_chunk(12, b"CCCCCCCC").await.unwrap();
+        assert!(parked.elapsed() >= BACKLOG_GRACE);
+        assert_eq!(state.lock().await.aggregate().dropped_total, 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn on_segment_retired_trims_completed_keeps_straddling_bytes() {
         let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
@@ -1373,6 +1437,6 @@ mod tests {
             .register_connection(0x1004, 1, None)
             .expect("current timeline");
         let q = s.drain_send_queue(cur).expect("in-progress backfill kept");
-        assert_eq!(&q[WIRE_HDR..], b"BBBB", "no gap after trim");
+        assert_eq!(&q[WAL_FRAME_HEADER..], b"BBBB", "no gap after trim");
     }
 }

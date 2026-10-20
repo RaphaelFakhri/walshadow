@@ -88,6 +88,8 @@ count_kinds! {
     QueuedWake => "queued_wake";
     /// Standby status reports plus connection attaches
     AppliedWake => "applied_wake";
+    /// Send queues the listener took plus connection drops
+    DrainedWake => "drained_wake";
 }
 
 macro_rules! observed {
@@ -97,7 +99,7 @@ macro_rules! observed {
 observed! {
     SourceReceived, ShadowReplay, ShadowFlush, ShadowDispatched, Drain, EmitterAck,
     ResumeSafe, XactFirst, FilterDispatched, Commit, Snapshot, Switchpoint,
-    AckFrontier, QueuedWake, AppliedWake,
+    AckFrontier, QueuedWake, AppliedWake, DrainedWake,
 }
 
 pub struct Pos<K>(u64, PhantomData<fn() -> K>);
