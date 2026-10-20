@@ -22,7 +22,7 @@ use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
-use crate::toast::value_cache::ValueCache;
+use crate::toast::value_cache::{AHEAD_READS, Cached, Shared, ValueCache};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -403,6 +403,10 @@ pub trait ChunkStore: Send + Sync {
         values: &[(u32, usize)],
         max_lsn: u64,
     ) -> Result<Vec<FetchedValue>, ChunkStoreError>;
+    /// Wait until a read at `max_lsn` would not
+    async fn await_bound(&self, _max_lsn: u64) -> Result<(), ChunkStoreError> {
+        Ok(())
+    }
     /// [`Self::fetch_many`] for one value
     async fn fetch(
         &self,
@@ -1115,7 +1119,7 @@ pub struct ToastResolver {
     /// materialization); `None` = unmetered (serial/metrics-only paths)
     budget: Option<crate::budget::MemoryBudget>,
     /// Commit-ordered planning only, see [`crate::toast::value_cache`]
-    values: Option<Arc<std::sync::Mutex<ValueCache>>>,
+    values: Option<Arc<Shared>>,
 }
 
 impl ToastResolver {
@@ -1225,36 +1229,127 @@ impl ToastResolver {
 
     /// Fresh value cache for one commit-ordered planner
     pub fn with_value_cache(mut self, bytes: usize) -> Self {
-        self.values = Some(Arc::new(std::sync::Mutex::new(ValueCache::new(bytes))));
+        self.values = Some(Arc::new(Shared {
+            cache: std::sync::Mutex::new(ValueCache::new(bytes)),
+            reads: tokio::sync::Semaphore::new(AHEAD_READS),
+        }));
         self
     }
 
     fn cache(&self) -> Option<std::sync::MutexGuard<'_, ValueCache>> {
-        Some(self.values.as_ref()?.lock().expect("value cache"))
+        Some(self.values.as_ref()?.cache.lock().expect("value cache"))
     }
 
-    /// Replace each external column an earlier row version resolved with
-    /// its value, returning the bytes served
-    pub fn fill_cached(
+    /// Start reading `p` for a row at `lsn` while earlier commits plan, so
+    /// planning usually finds it decoded. Reads nothing the cache knows
+    pub fn read_ahead(&self, db_oid: u32, p: ToastPointer, type_oid: u32, lsn: u64) {
+        let Some(values) = self.values.clone() else {
+            return;
+        };
+        if self.fill_on_miss() || self.value_oversize(&p) {
+            return;
+        }
+        let Some(cell) = self
+            .cache()
+            .and_then(|mut c| c.reserve(db_oid, &p, type_oid, lsn))
+        else {
+            return;
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            // Wait for replay outside the read permits
+            if let Some(store) = this.store_for(db_oid) {
+                store.await_bound(lsn).await.ok();
+            }
+            let _permit = values.reads.acquire().await;
+            cell.value
+                .get_or_init(|| async {
+                    this.stats
+                        .toast_values_read_ahead
+                        .fetch_add(1, Ordering::Relaxed);
+                    this.read_value(db_oid, p, type_oid, lsn).await
+                })
+                .await;
+        });
+    }
+
+    fn store_for(&self, db_oid: u32) -> Option<&Arc<dyn ChunkStore>> {
+        match &self.database_stores {
+            Some(stores) => stores.get(&db_oid),
+            None => self.store.as_ref(),
+        }
+    }
+
+    /// Decoded value of `p` from the store, `None` for anything but whole
+    /// chunks, which planning resolves the usual way
+    async fn read_value(
+        &self,
+        db_oid: u32,
+        p: ToastPointer,
+        type_oid: u32,
+        lsn: u64,
+    ) -> Option<ColumnValue> {
+        let got = self
+            .store_for(db_oid)?
+            .fetch(
+                db_oid,
+                p.va_toastrelid,
+                p.va_valueid,
+                lsn,
+                pointer_extsize(&p),
+            )
+            .await
+            .ok()?;
+        let FetchedValue::Assembled(stored) = got else {
+            return None;
+        };
+        Some(detoasted_value(finish_value(&p, stored).ok()?, type_oid))
+    }
+
+    /// Replace each external column an earlier row version or a read ahead
+    /// resolved with its value, returning the bytes served
+    pub async fn fill_cached(
         &self,
         db_oid: u32,
         t: &mut crate::decode::heap_decoder::DecodedTuple,
         rel: &crate::schema::RelDescriptor,
+        lsn: u64,
     ) -> usize {
-        let Some(mut cache) = self.cache() else {
-            return 0;
-        };
         let mut served = 0;
         for (col, attr) in t.columns.iter_mut().zip(&rel.attributes) {
-            if let Some(ColumnValue::ExternalToast(p)) = col
-                && let Some(v) = cache.get(db_oid, p, attr.type_oid)
-            {
-                served += v.approx_bytes();
-                *col = Some(v);
-                self.stats
-                    .toast_value_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            let Some(ColumnValue::ExternalToast(p)) = col else {
+                continue;
+            };
+            let (p, type_oid) = (*p, attr.type_oid);
+            let Some(got) = self.cache().and_then(|mut c| c.get(db_oid, &p, type_oid)) else {
+                continue;
+            };
+            let v = match got {
+                Cached::Ready(v) => v,
+                // A read for a later row may have seen this row's value die
+                Cached::Pending(cell) if cell.lsn > lsn => continue,
+                Cached::Pending(cell) => {
+                    let started = std::time::Instant::now();
+                    let v = cell
+                        .value
+                        .get_or_init(|| self.read_value(db_oid, p, type_oid, cell.lsn))
+                        .await
+                        .clone();
+                    self.stats
+                        .toast_value_fetch_nanos
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let Some(v) = v else {
+                        continue;
+                    };
+                    self.remember_value(db_oid, &p, type_oid, &v);
+                    v
+                }
+            };
+            served += v.approx_bytes();
+            *col = Some(v);
+            self.stats
+                .toast_value_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
         }
         served
     }

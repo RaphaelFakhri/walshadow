@@ -856,11 +856,11 @@ mod tests {
 
     /// Value ids come from a tiny wrapping OID space, as in PostgreSQL only
     /// once every chunk of the previous value is vacuumed, truncated or
-    /// rewritten away; rewrites assign ids no WAL birth shows. Shadow
-    /// replays up to a few commits ahead of planning. Whatever the
-    /// sequence, lead and budget, a row planned through the value cache
-    /// carries the value its pointer names at that commit whenever a store
-    /// read at planning does, and NULL at worst
+    /// rewritten away; rewrites assign ids no WAL birth shows. Shadow and
+    /// predecode run up to a few commits ahead of planning. Whatever the
+    /// sequence, lead and budget, a row planned through the value cache and
+    /// reads ahead carries the value its pointer names at that commit
+    /// whenever a store read at planning does, and NULL at worst
     #[tokio::test(flavor = "current_thread")]
     async fn value_cache_plans_what_the_store_holds() {
         const TOAST: u32 = 16700;
@@ -997,7 +997,29 @@ mod tests {
                     _ => continue,
                 }
                 *store.0.lock().unwrap() = index.clone();
+                // An update that aborts leaves its read ahead unconsumed
+                if let Some(&vid) = rows.get(below(rows.len() as u64 * 4 + 1) as usize) {
+                    let h = row(1_000_000 + c, lsn + 0x40, HeapOp::Update, vid);
+                    for b in &mut bufs {
+                        b.on_heap(h.clone()).await.unwrap();
+                        b.abort(1_000_000 + c, crate::pos::Pos::new(lsn + 0x80), &[])
+                            .await
+                            .unwrap();
+                    }
+                    events.push((None, h));
+                }
                 for (born, h) in &events {
+                    // Predecode reads ahead the values rows keep
+                    if born.is_none()
+                        && let Some(t) = h.decoded.new.as_ref().or(h.decoded.old.as_ref())
+                        && let Some(ColumnValue::ExternalToast(p)) = t.columns[0]
+                    {
+                        cached.read_ahead(rel.rfn.db_node, p, TEXTOID, h.decoded.source_lsn);
+                        tokio::task::yield_now().await;
+                    }
+                    if h.decoded.xid >= 1_000_000 {
+                        continue;
+                    }
                     for b in &mut bufs {
                         if let Some((vid, body)) = born {
                             let chunk = crate::xact::spill::ToastChunk {

@@ -226,6 +226,11 @@ impl ShadowToastStore {
 
 #[async_trait]
 impl ChunkStore for ShadowToastStore {
+    async fn await_bound(&self, max_lsn: u64) -> Result<(), ChunkStoreError> {
+        let bridge = self.bridge().await?;
+        self.await_replay(bridge, max_lsn).await.map(drop)
+    }
+
     /// Treat `max_lsn` as minimum replay position. Chunks precede referring
     /// record, so reaching this position makes value available
     async fn fetch_many(

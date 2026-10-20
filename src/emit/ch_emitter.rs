@@ -2674,6 +2674,8 @@ crate::atomic_stats! {
         pub toast_value_fetch_nanos,
         /// Values served by the value cache instead of the store
         pub toast_value_cache_hits,
+        /// Store reads started ahead of planning, off the serial path
+        pub toast_values_read_ahead,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,

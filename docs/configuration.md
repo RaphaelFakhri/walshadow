@@ -240,9 +240,11 @@ The three buffering settings require positive integers.
 An update that leaves a large value unchanged carries the same pointer, so the
 row needs the value again. `value_cache_bytes` bounds decoded values kept from
 the transaction WAL and earlier reads, least recently used out, so such rows
-skip the read and the decode. The cache is outside `[memory]`
+skip the read and the decode. Values the cache lacks are read from the store
+as soon as the row is decoded, up to one read per bridge worker at a time, so
+planning finds them ready. The cache is outside `[memory]`
 `resident_payload_max`. `toast_value_cache_hits_total` counts values served
-from it
+from it, `toast_values_read_ahead_total` the reads started early
 `[bootstrap] lanes` and `[ch] inserter_pool_size` controls are independent
 
 ### Value mode

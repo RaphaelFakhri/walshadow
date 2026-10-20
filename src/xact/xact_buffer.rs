@@ -2420,11 +2420,14 @@ pub async fn detoast_heap(
     let rel = heap.descriptor.clone();
     let db = heap.decoded.rfn.db_node;
     // Values an earlier row version resolved skip store and decode both
-    let cached: usize = [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()]
+    let lsn = heap.decoded.source_lsn;
+    let mut cached = 0;
+    for t in [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()]
         .into_iter()
         .flatten()
-        .map(|t| resolver.fill_cached(db, t, &rel))
-        .sum();
+    {
+        cached += resolver.fill_cached(db, t, &rel, lsn).await;
+    }
     let mut pointers: Vec<ToastPointer> = Vec::new();
     collect_toast_pointers(heap.decoded.new.as_ref(), &mut pointers);
     collect_toast_pointers(heap.decoded.old.as_ref(), &mut pointers);
@@ -2842,6 +2845,51 @@ pub(crate) fn reassemble_value_ref(
     Ok(Reassembled::Bytes(finish_value(p, concat)?))
 }
 
+thread_local! {
+    /// Value ids whose chunks this predecode thread decoded lately. A batch
+    /// predecodes in WAL order, so a value written by the same transaction
+    /// as the row usually shows here first
+    static BORN: std::cell::RefCell<VecDeque<(u32, u32)>> = const {
+        std::cell::RefCell::new(VecDeque::new())
+    };
+}
+
+/// Start store reads of the values updated and deleted rows keep. An insert,
+/// and a value born just before its row, carries its chunks in its own WAL
+fn read_ahead_kept(
+    ahead: &ToastResolver,
+    rel: &RelDescriptor,
+    set: &crate::decode::heap_decoder::DecodedHeaps,
+) {
+    BORN.with_borrow_mut(|born| {
+        for d in set {
+            if rel.kind == 't' {
+                if let Some(Some(ColumnValue::Oid(id))) =
+                    d.new.as_ref().and_then(|t| t.columns.first())
+                {
+                    if born.len() == 1024 {
+                        born.pop_front();
+                    }
+                    born.push_back((rel.oid, *id));
+                }
+                continue;
+            }
+            if d.op == HeapOp::Insert {
+                continue;
+            }
+            for t in [&d.new, &d.old].into_iter().flatten() {
+                for (col, attr) in t.columns.iter().zip(&rel.attributes) {
+                    if let &Some(ColumnValue::ExternalToast(p)) = col
+                        && !born.contains(&(p.va_toastrelid, p.va_valueid))
+                    {
+                        ahead.read_ahead(d.rfn.db_node, p, attr.type_oid, d.source_lsn);
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Decodes `Route::ToDecoder` user-heap records into the xact buffer.
 /// Toast-relation INSERTs (`rel.kind == 't'`) reinterpret as
 /// [`ToastChunk`]; semantic errors absorb into [`DecoderStats`] rather
@@ -2883,7 +2931,12 @@ impl BufferingDecoderSink {
     /// ahead of the worker. `None` wherever the worker would not decode
     /// against a live descriptor; the worker re-resolves and keeps the
     /// result only on the same descriptor version
-    pub fn predecoder(&self) -> impl Fn(&Record<'_>) -> Option<Predecoded> + Send + Sync + 'static {
+    ///
+    /// Starts the store reads of values updated rows keep, through `ahead`
+    pub fn predecoder(
+        &self,
+        ahead: ToastResolver,
+    ) -> impl Fn(&Record<'_>) -> Option<Predecoded> + Send + Sync + 'static {
         let logs = self.logs.clone();
         move |record| {
             let rm = record.parsed.header.resource_manager_id;
@@ -2907,6 +2960,7 @@ impl BufferingDecoderSink {
                 .peek_spanned(rfn, record.source_lsn)
                 .ok()?;
             let set = decode_heap_record(&record.parsed, record.source_lsn, &rel).ok()?;
+            read_ahead_kept(&ahead, &rel, &set);
             Some(Predecoded::new(rel, valid_from, set))
         }
     }

@@ -259,6 +259,11 @@ impl ReorderSink {
         })
     }
 
+    /// Resolver this sink plans with, its value cache included
+    pub fn planning_resolver(&self) -> ToastResolver {
+        self.resolver.clone()
+    }
+
     /// Route-point steps 1–2 close out here: preceding schema/config state is
     /// applied, so drop memoized routes and freeze mapping + resolved-config
     /// versions for the next interval. Per commit this is the
