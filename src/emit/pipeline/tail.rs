@@ -307,7 +307,6 @@ pub async fn spawn_with_config(
             retry: emitter.retry.clone(),
             stats: stats.clone(),
             fatal: fatal.clone(),
-            config_rx: config_rx.clone(),
         },
     );
 

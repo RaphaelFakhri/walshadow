@@ -1153,7 +1153,7 @@ fn text(b: &[u8]) -> Result<String, BridgeError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::net::UnixListener;
 
@@ -1267,7 +1267,7 @@ mod tests {
         out
     }
 
-    fn hello_body(proto: u32, projection: u32) -> Vec<u8> {
+    pub(crate) fn hello_body(proto: u32, projection: u32) -> Vec<u8> {
         let mut b = vec![0u8];
         b.extend_from_slice(&proto.to_be_bytes());
         b.extend_from_slice(&projection.to_be_bytes());
@@ -1297,7 +1297,7 @@ mod tests {
         }
     }
 
-    fn spawn_worker(script: Vec<Option<Vec<u8>>>) -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn spawn_worker(script: Vec<Option<Vec<u8>>>) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bridge.sock");
         let listener = UnixListener::bind(&path).unwrap();

@@ -15,14 +15,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use backon::Retryable;
 use clickhouse_c::Allocator;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::ch::EmitterError;
-use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::{ColumnBuf, EmitterStats, RetryConfig, literal_column};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::batcher::InsertBatch;
@@ -39,11 +38,10 @@ pub(crate) struct ResolvedBatch {
 #[derive(Clone)]
 pub(crate) struct ResolverOptions {
     pub oracle: Option<Arc<Oracle>>,
-    /// Boot budget for oracle transport retries, re-read from `config_rx`
+    /// Backoff between oracle transport retries
     pub retry: RetryConfig,
     pub stats: Arc<EmitterStats>,
     pub fatal: Fatal,
-    pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 }
 
 /// Spawn `n` resolvers over the shared batch queue. Drops the sender it was
@@ -66,27 +64,25 @@ async fn run(
 ) {
     let ResolverOptions {
         oracle,
-        mut retry,
+        retry,
         stats,
         fatal,
-        config_rx,
     } = opts;
     let alloc = Allocator::global(&mimalloc::MiMalloc);
     while let Ok(mut batch) = rx.recv().await {
-        if let Some(rx) = config_rx.as_ref() {
-            retry.max_attempts = rx.borrow().retry_max_attempts;
-        }
         resolve_local_columns(&mut batch, &stats);
         let started = std::time::Instant::now();
-        let resolved = match resolve_oracle_with_retry(&oracle, alloc, &batch, &retry, &stats).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // Seq stays unacknowledged, so a restart replays it
-                fatal.set(format!("oracle resolve: {e}"));
-                return;
-            }
-        };
+        let resolved =
+            match resolve_oracle_with_retry(&oracle, alloc, &batch, &retry, &stats, SHADOW_OUTAGE)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // Seq stays unacknowledged, so a restart replays it
+                    fatal.set(format!("oracle resolve: {e}"));
+                    return;
+                }
+            };
         stats
             .oracle_resolve_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -111,17 +107,24 @@ fn resolve_local_columns(batch: &mut InsertBatch, stats: &EmitterStats) {
     }
 }
 
-/// Retry transport failures only
+/// Longest a batch waits out a shadow that stopped answering. A startup
+/// process crash takes the postmaster down, so the shadow comes back through
+/// the supervisor and crash recovery: minutes, not the seconds `retry` budgets
+const SHADOW_OUTAGE: Duration = Duration::from_secs(15 * 60);
+
+/// Retry transport failures only, for as long as `outage`
 async fn resolve_oracle_with_retry(
     oracle: &Option<Arc<Oracle>>,
     alloc: Allocator,
     batch: &InsertBatch,
     retry: &RetryConfig,
     stats: &EmitterStats,
+    outage: Duration,
 ) -> Result<Option<OracleBlock>, EmitterError> {
+    let deadline = tokio::time::Instant::now() + outage;
     (|| resolve_oracle(oracle, alloc, batch))
-        .retry(retry.backoff())
-        .when(OracleError::retryable)
+        .retry(retry.backoff().without_max_times())
+        .when(|e: &OracleError| e.retryable() && tokio::time::Instant::now() < deadline)
         .notify(|_, _| {
             stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
         })
@@ -333,6 +336,38 @@ mod tests {
         );
         resolve_local_columns(&mut batch, &stats);
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 1);
+    }
+
+    /// Transport failures retry past the attempt budget meant for blips, since
+    /// a shadow restart outlasts it, and give up only once the outage bound passes
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_bridge_retries_past_the_attempt_budget() {
+        use crate::ops::bridge::tests::{hello_body, spawn_worker};
+        use crate::ops::bridge::{Bridge, PROJECTION_VERSION, PROTO_VERSION};
+
+        // Worker answers HELLO once, then drops every connection
+        let (_tmp, path) = spawn_worker(vec![Some(hello_body(PROTO_VERSION, PROJECTION_VERSION))]);
+        let oracle = Some(Arc::new(Oracle::new(Arc::new(
+            Bridge::connect(&path).await.unwrap(),
+        ))));
+        let batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let retry = RetryConfig {
+            max_attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+        };
+        let stats = EmitterStats::default();
+        let outage = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let res = resolve_oracle_with_retry(&oracle, alloc, &batch, &retry, &stats, outage).await;
+        assert!(res.is_err());
+        assert!(
+            started.elapsed() >= outage,
+            "gave up {:?} in",
+            started.elapsed()
+        );
+        assert!(stats.retries_attempted.load(Ordering::Relaxed) > u64::from(retry.max_attempts));
     }
 
     /// A cell PG must convert keeps the whole column in the request, even
